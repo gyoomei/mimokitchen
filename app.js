@@ -39,6 +39,7 @@ const T = {
     cook: 'Cook three ways',
     errMin: 'Add at least 3 ingredients.',
     errFetch: "Couldn't reach the kitchen. Try again in a moment.",
+    errBusy: "Kitchen is busy. Wait 20 seconds and tap Cook again.",
     errParse: "Recipe came back malformed. Cooking again…",
     loadingFetch: 'Browsing the pantry…',
     loadingCompose: 'Three chefs at the stove…',
@@ -120,6 +121,7 @@ const T = {
     cook: 'Masak tiga cara',
     errMin: 'Tambah minimal 3 bahan.',
     errFetch: 'Dapur tidak terjangkau. Coba lagi sebentar.',
+    errBusy: 'Dapur lagi sibuk. Tunggu 20 detik lalu tekan Masak lagi.',
     errParse: 'Resep agak berantakan. Memasak ulang…',
     loadingFetch: 'Membuka isi pantry…',
     loadingCompose: 'Tiga chef di kompor…',
@@ -315,42 +317,39 @@ function renderChips() {
 // ─── Pollinations call ───
 async function callPollinations(prompt) {
   const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 90000);
+  const tid = setTimeout(() => ctrl.abort(), 75000);
   try {
-    // Try POST /openai first
     const res = await fetch('https://text.pollinations.ai/openai?referrer=mimokitchen', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'openai',
-        messages: [{ role: 'user', content: prompt }],
+        model: 'openai-fast',
+        messages: [
+          { role: 'system', content: 'You are MimoKitchen, a strict JSON-only chef. Output one JSON object. No prose, no fences, no reasoning.' },
+          { role: 'user', content: prompt }
+        ],
         referrer: 'mimokitchen',
-        temperature: 0.85,
+        temperature: 0.7,
       }),
       signal: ctrl.signal,
     });
-    if (res.ok) {
-      const data = await res.json();
-      return data?.choices?.[0]?.message?.content || '';
-    }
     if (res.status === 429) throw new Error('pollinations:429');
-    throw new Error('pollinations:' + res.status);
+    if (!res.ok) throw new Error('pollinations:' + res.status);
+    const data = await res.json();
+    return data?.choices?.[0]?.message?.content || '';
   } finally {
     clearTimeout(tid);
   }
 }
 
 async function callPollinationsGET(prompt) {
-  // Fallback to GET endpoint — different rate-limit pool
   const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 90000);
+  const tid = setTimeout(() => ctrl.abort(), 75000);
   try {
-    const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?referrer=mimokitchen&model=openai&json=true`;
+    const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?referrer=mimokitchen&model=openai-fast&json=true`;
     const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) {
-      if (res.status === 429) throw new Error('pollinations-get:429');
-      throw new Error('pollinations-get:' + res.status);
-    }
+    if (res.status === 429) throw new Error('pollinations-get:429');
+    if (!res.ok) throw new Error('pollinations-get:' + res.status);
     return await res.text();
   } finally {
     clearTimeout(tid);
@@ -359,21 +358,54 @@ async function callPollinationsGET(prompt) {
 
 function extractJson(text) {
   if (!text) return null;
+  const tryParse = (s) => {
+    try { return JSON.parse(s); } catch {}
+    try { return JSON.parse(s.replace(/,(\s*[}\]])/g, '$1')); } catch {}
+    return null;
+  };
+
+  // 1. Try the raw text
+  let parsed = tryParse(text.trim());
+  if (parsed) return parsed;
+
+  // 2. Strip markdown fence
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  const candidate = fence ? fence[1] : text;
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
-  const slice = candidate.slice(start, end + 1);
-  try {
-    return JSON.parse(slice);
-  } catch {
-    try {
-      return JSON.parse(slice.replace(/,(\s*[}\]])/g, '$1'));
-    } catch {
-      return null;
+  if (fence) {
+    parsed = tryParse(fence[1].trim());
+    if (parsed) return parsed;
+  }
+
+  // 3. Find balanced { ... } scan, skipping reasoning prefix
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        const slice = text.slice(start, i + 1);
+        parsed = tryParse(slice);
+        if (parsed) return parsed;
+        break;
+      }
     }
   }
+
+  // 4. Last-resort: greedy first { to last }
+  const end = text.lastIndexOf('}');
+  if (end > start) {
+    parsed = tryParse(text.slice(start, end + 1));
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 // ─── recipe generation ───
@@ -385,24 +417,24 @@ function buildPrompt() {
     ? filters.map((f) => T[state.lang].filters[f]).join(', ')
     : 'none';
 
-  return `You are MimoKitchen. User has: ${ingredients}. Filters: ${filterDesc}. Language: ${lang}.
+  return `User has: ${ingredients}. Filters: ${filterDesc}. Language: ${lang}.
 
-Write 3 short recipes. Return STRICT JSON only:
+Output exactly ONE JSON object with three recipes — fast, fancy, healthy. No prose, no markdown, no fences.
 
-{"cuisine_lean":"Italian, Mediterranean","fast":REC,"fancy":REC,"healthy":REC}
+Schema:
+{"cuisine_lean":"string","fast":REC,"fancy":REC,"healthy":REC}
 
-Where each REC = {"name":"name","tagline":"one short line no period","time_min":15,"servings":2,"difficulty":"easy","ingredients_have":["3-4 from user list"],"ingredients_need":["1-3 pantry extras"],"steps":["step 1","step 2","step 3","step 4","step 5"],"tips":["tip 1","tip 2"],"leftover":"one sentence reuse"}
+REC schema:
+{"name":"string","tagline":"short line no period","time_min":15,"servings":2,"difficulty":"easy|medium|hard","ingredients_have":["3-4 from user list"],"ingredients_need":["1-3 pantry items"],"steps":["s1","s2","s3","s4","s5"],"tips":["t1","t2"],"leftover":"one short sentence"}
 
-Rules:
-- fast: under 20 min, weeknight pace
-- fancy: weekend project, more technique
-- healthy: light, vegetable-forward
-- 5 steps EXACTLY each, action verb first
-- 2 tips EXACTLY each
-- Each step under 100 chars
-- Each tip under 80 chars
-- ALL strings in ${lang}
-- No markdown, no fence, no comments`;
+Constraints:
+- fast = under 20 min, weeknight pace
+- fancy = weekend project, more technique
+- healthy = light, vegetable-forward
+- 5 steps each, action-verb first, under 100 chars per step
+- 2 tips each, under 80 chars per tip
+- ALL strings written in ${lang}
+- Output JSON only, starting with { and ending with }`;
 }
 
 function detectCuisineLean() {
@@ -433,48 +465,41 @@ async function cook() {
   $('loadBox').classList.add('on');
   $('loadMsg').textContent = t('loadingFetch');
 
-  await new Promise((r) => setTimeout(r, 300));
+  await new Promise((r) => setTimeout(r, 250));
   state.currentLoadKey = 'loadingCompose';
   $('loadMsg').textContent = t('loadingCompose');
 
   let recipes = null;
-  let attempt = 0;
-  while (attempt < 4 && !recipes) {
-    attempt++;
+  let lastErr = null;
+  // 2-attempt strategy: GET first (no preflight), POST as fallback.
+  // Each attempt tolerates partial result (1+ recipe key with steps).
+  const callOrder = [callPollinationsGET, callPollinations];
+  for (let attempt = 0; attempt < callOrder.length && !recipes; attempt++) {
     try {
-      // GET endpoint first — no CORS preflight, lower latency
-      const callFn = attempt === 1 || attempt === 3 ? callPollinationsGET : callPollinations;
-      const raw = await callFn(buildPrompt());
+      const raw = await callOrder[attempt](buildPrompt());
       const parsed = extractJson(raw);
-      if (parsed && parsed.fast && parsed.fancy && parsed.healthy &&
-          parsed.fast.steps && parsed.fancy.steps && parsed.healthy.steps) {
-        recipes = parsed;
-        break;
-      }
       if (parsed && (parsed.fast?.steps || parsed.fancy?.steps || parsed.healthy?.steps)) {
         recipes = parsed;
         break;
       }
-      console.warn('cook attempt', attempt, 'malformed');
+      console.warn('cook attempt', attempt + 1, 'malformed; len=', raw?.length || 0);
+      lastErr = new Error('malformed');
     } catch (e) {
-      console.error('cook attempt', attempt, e.message || e);
+      lastErr = e;
+      console.error('cook attempt', attempt + 1, e.message || e);
       const code = String(e.message || '');
+      // 429 → wait briefly before next strategy
       if (code.includes('429')) {
-        await new Promise((r) => setTimeout(r, 6000 + attempt * 4000));
-        continue;
+        await new Promise((r) => setTimeout(r, 3500));
       }
-      if (code.includes('502') || code.includes('aborted') || code.includes('Failed to fetch')) {
-        await new Promise((r) => setTimeout(r, 4000));
-        continue;
-      }
-    }
-    if (!recipes && attempt < 4) {
-      await new Promise((r) => setTimeout(r, 3000));
     }
   }
 
   if (!recipes) {
-    showError(t('errFetch'));
+    const msg = String(lastErr?.message || '').includes('429')
+      ? t('errBusy')
+      : t('errFetch');
+    showError(msg);
     $('loadBox').classList.remove('on');
     state.busy = false;
     $('cookBtn').disabled = false;
@@ -485,7 +510,7 @@ async function cook() {
 
   state.currentLoadKey = 'loadingPlate';
   $('loadMsg').textContent = t('loadingPlate');
-  await new Promise((r) => setTimeout(r, 250));
+  await new Promise((r) => setTimeout(r, 200));
 
   state.recipes = recipes;
   const variants = ['fast', 'fancy', 'healthy'];

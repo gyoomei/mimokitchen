@@ -648,7 +648,11 @@ function init() {
   inp.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ',') {
       e.preventDefault();
-      addIngredient(inp.value.replace(/,/g, ''));
+      const parts = inp.value
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      parts.forEach(addIngredient);
       inp.value = '';
     } else if (e.key === 'Backspace' && !inp.value && state.ingredients.length) {
       removeIngredient(state.ingredients[state.ingredients.length - 1]);

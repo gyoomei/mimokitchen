@@ -315,9 +315,9 @@ function renderChips() {
 }
 
 // ─── Pollinations call ───
-async function callPollinations(prompt) {
+async function callPollinations(prompt, maxTokens = 1200) {
   const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 75000);
+  const tid = setTimeout(() => ctrl.abort(), 60000);
   try {
     const res = await fetch('https://text.pollinations.ai/openai?referrer=mimokitchen', {
       method: 'POST',
@@ -325,11 +325,12 @@ async function callPollinations(prompt) {
       body: JSON.stringify({
         model: 'openai-fast',
         messages: [
-          { role: 'system', content: 'You are MimoKitchen, a strict JSON-only chef. Output one JSON object. No prose, no fences, no reasoning.' },
+          { role: 'system', content: 'You are MimoKitchen, a strict JSON-only chef. Output one JSON object. No prose, no markdown fences, no reasoning text.' },
           { role: 'user', content: prompt }
         ],
         referrer: 'mimokitchen',
         temperature: 0.7,
+        max_tokens: maxTokens,
       }),
       signal: ctrl.signal,
     });
@@ -337,20 +338,6 @@ async function callPollinations(prompt) {
     if (!res.ok) throw new Error('pollinations:' + res.status);
     const data = await res.json();
     return data?.choices?.[0]?.message?.content || '';
-  } finally {
-    clearTimeout(tid);
-  }
-}
-
-async function callPollinationsGET(prompt) {
-  const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 75000);
-  try {
-    const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?referrer=mimokitchen&model=openai-fast&json=true`;
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (res.status === 429) throw new Error('pollinations-get:429');
-    if (!res.ok) throw new Error('pollinations-get:' + res.status);
-    return await res.text();
   } finally {
     clearTimeout(tid);
   }
@@ -409,7 +396,7 @@ function extractJson(text) {
 }
 
 // ─── recipe generation ───
-function buildPrompt() {
+function buildOnePrompt(variant) {
   const lang = state.lang === 'id' ? 'Indonesian (Bahasa Indonesia)' : 'English';
   const ingredients = state.ingredients.join(', ');
   const filters = Array.from(state.filters);
@@ -417,24 +404,27 @@ function buildPrompt() {
     ? filters.map((f) => T[state.lang].filters[f]).join(', ')
     : 'none';
 
-  return `User has: ${ingredients}. Filters: ${filterDesc}. Language: ${lang}.
+  const variantSpec = {
+    fast: 'a FAST weeknight recipe under 20 minutes total time, easy difficulty, simple technique',
+    fancy: 'a FANCY weekend recipe with more technique, medium-to-hard difficulty, restaurant-style plating',
+    healthy: 'a HEALTHY light recipe, vegetable-forward, fresh flavors, balanced nutrition',
+  }[variant];
 
-Output exactly ONE JSON object with three recipes — fast, fancy, healthy. No prose, no markdown, no fences.
+  return `User has these ingredients: ${ingredients}.
+Filters to respect: ${filterDesc}.
+Language for ALL strings: ${lang}.
 
-Schema:
-{"cuisine_lean":"string","fast":REC,"fancy":REC,"healthy":REC}
+Compose ${variantSpec}.
 
-REC schema:
-{"name":"string","tagline":"short line no period","time_min":15,"servings":2,"difficulty":"easy|medium|hard","ingredients_have":["3-4 from user list"],"ingredients_need":["1-3 pantry items"],"steps":["s1","s2","s3","s4","s5"],"tips":["t1","t2"],"leftover":"one short sentence"}
+Output exactly ONE JSON object, no prose, no markdown, no fences. Schema:
+
+{"name":"recipe name","tagline":"one short line no period","time_min":15,"servings":2,"difficulty":"easy","ingredients_have":["3-4 items from user list"],"ingredients_need":["1-3 pantry extras"],"steps":["s1","s2","s3","s4","s5"],"tips":["t1","t2"],"leftover":"one short sentence"}
 
 Constraints:
-- fast = under 20 min, weeknight pace
-- fancy = weekend project, more technique
-- healthy = light, vegetable-forward
-- 5 steps each, action-verb first, under 100 chars per step
-- 2 tips each, under 80 chars per tip
-- ALL strings written in ${lang}
-- Output JSON only, starting with { and ending with }`;
+- Exactly 5 steps, action-verb first, under 100 chars per step
+- Exactly 2 tips, under 80 chars per tip
+- ALL strings in ${lang}
+- Output starts with { and ends with }`;
 }
 
 function detectCuisineLean() {
@@ -448,6 +438,28 @@ function detectCuisineLean() {
   if (/(curry|garam masala|turmeric|coriander|cardamom|paneer)/.test(i)) cuisines.push('South Asian');
   if (/(olive oil|tomato|garlic|herb|lemon|feta)/.test(i) && !cuisines.includes('Italian')) cuisines.push('Mediterranean');
   return cuisines.length ? cuisines.slice(0, 3).join(', ') : (state.lang === 'id' ? 'Bebas' : 'Free-form');
+}
+
+async function cookOne(variant) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const raw = await callPollinations(buildOnePrompt(variant), 900);
+      const parsed = extractJson(raw);
+      if (parsed && Array.isArray(parsed.steps) && parsed.steps.length >= 3) {
+        return parsed;
+      }
+      lastErr = new Error('malformed:' + variant + ':len=' + (raw?.length || 0));
+      console.warn(lastErr.message);
+    } catch (e) {
+      lastErr = e;
+      const code = String(e.message || '');
+      if (code.includes('429')) {
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+    }
+  }
+  throw lastErr || new Error('cook failed: ' + variant);
 }
 
 async function cook() {
@@ -464,56 +476,49 @@ async function cook() {
   state.currentLoadKey = 'loadingFetch';
   $('loadBox').classList.add('on');
   $('loadMsg').textContent = t('loadingFetch');
+  await new Promise((r) => setTimeout(r, 200));
 
-  await new Promise((r) => setTimeout(r, 250));
   state.currentLoadKey = 'loadingCompose';
   $('loadMsg').textContent = t('loadingCompose');
 
-  let recipes = null;
+  // Sequential per-variant calls — small responses fit comfortably,
+  // each parses cleanly, gentle on Pollinations queue.
+  const variants = ['fast', 'fancy', 'healthy'];
+  const recipes = { cuisine_lean: detectCuisineLean() };
+  let succeeded = 0;
   let lastErr = null;
-  // 2-attempt strategy: GET first (no preflight), POST as fallback.
-  // Each attempt tolerates partial result (1+ recipe key with steps).
-  const callOrder = [callPollinationsGET, callPollinations];
-  for (let attempt = 0; attempt < callOrder.length && !recipes; attempt++) {
+
+  for (let i = 0; i < variants.length; i++) {
+    const v = variants[i];
     try {
-      const raw = await callOrder[attempt](buildPrompt());
-      const parsed = extractJson(raw);
-      if (parsed && (parsed.fast?.steps || parsed.fancy?.steps || parsed.healthy?.steps)) {
-        recipes = parsed;
-        break;
-      }
-      console.warn('cook attempt', attempt + 1, 'malformed; len=', raw?.length || 0);
-      lastErr = new Error('malformed');
+      recipes[v] = await cookOne(v);
+      succeeded++;
+      // Update load message with progress
+      $('loadMsg').textContent = `${t('loadingCompose')} (${succeeded}/3)`;
     } catch (e) {
       lastErr = e;
-      console.error('cook attempt', attempt + 1, e.message || e);
-      const code = String(e.message || '');
-      // 429 → wait briefly before next strategy
-      if (code.includes('429')) {
-        await new Promise((r) => setTimeout(r, 3500));
-      }
+      console.error('cookOne failed:', v, e.message || e);
+    }
+    // Small space between calls to be queue-friendly
+    if (i < variants.length - 1) {
+      await new Promise((r) => setTimeout(r, 600));
     }
   }
 
-  if (!recipes) {
-    const msg = String(lastErr?.message || '').includes('429')
-      ? t('errBusy')
-      : t('errFetch');
-    showError(msg);
+  if (succeeded === 0) {
+    const code = String(lastErr?.message || '');
+    showError(code.includes('429') ? t('errBusy') : t('errFetch'));
     $('loadBox').classList.remove('on');
     state.busy = false;
     $('cookBtn').disabled = false;
     return;
   }
 
-  if (!recipes.cuisine_lean) recipes.cuisine_lean = detectCuisineLean();
-
   state.currentLoadKey = 'loadingPlate';
   $('loadMsg').textContent = t('loadingPlate');
   await new Promise((r) => setTimeout(r, 200));
 
   state.recipes = recipes;
-  const variants = ['fast', 'fancy', 'healthy'];
   state.activeTab = variants.findIndex((v) => recipes[v]);
   if (state.activeTab < 0) state.activeTab = 0;
   $('loadBox').classList.remove('on');

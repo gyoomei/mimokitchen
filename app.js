@@ -442,7 +442,7 @@ function detectCuisineLean() {
 
 async function cookOne(variant) {
   let lastErr = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const raw = await callPollinations(buildOnePrompt(variant), 900);
       const parsed = extractJson(raw);
@@ -455,7 +455,10 @@ async function cookOne(variant) {
       lastErr = e;
       const code = String(e.message || '');
       if (code.includes('429')) {
-        await new Promise((r) => setTimeout(r, 4000));
+        // Queue-full from Pollinations — back off increasingly
+        await new Promise((r) => setTimeout(r, 3500 + attempt * 2500));
+      } else if (code.includes('aborted') || code.includes('Failed to fetch')) {
+        await new Promise((r) => setTimeout(r, 2000));
       }
     }
   }
@@ -499,9 +502,9 @@ async function cook() {
       lastErr = e;
       console.error('cookOne failed:', v, e.message || e);
     }
-    // Small space between calls to be queue-friendly
+    // Larger gap between calls to clear Pollinations queue slot
     if (i < variants.length - 1) {
-      await new Promise((r) => setTimeout(r, 600));
+      await new Promise((r) => setTimeout(r, 2500));
     }
   }
 
